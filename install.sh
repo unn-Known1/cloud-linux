@@ -26,6 +26,81 @@ NC='\033[0m'
 log() { echo -e "${BLUE}[*]${NC} $1"; }
 success() { echo -e "${GREEN}[✓]${NC} $1"; }
 warn() { echo -e "${YELLOW}[!]${NC} $1"; }
+error() { echo -e "${RED}[✗]${NC} $1"; }
+
+# Verify file checksum
+verify_checksum() {
+    local file="$1"
+    local expected_hash="$2"
+    local algorithm="${3:-sha256}"
+
+    if [[ ! -f "$file" ]]; then
+        error "File not found: $file"
+        return 1
+    fi
+
+    local actual_hash
+    case "$algorithm" in
+        sha256)
+            actual_hash=$(sha256sum "$file" | awk '{print $1}')
+            ;;
+        sha512)
+            actual_hash=$(sha512sum "$file" | awk '{print $1}')
+            ;;
+        md5)
+            actual_hash=$(md5sum "$file" | awk '{print $1}')
+            ;;
+        *)
+            error "Unsupported hash algorithm: $algorithm"
+            return 1
+            ;;
+    esac
+
+    if [[ "$actual_hash" == "$expected_hash" ]]; then
+        success "Checksum verified for $(basename "$file")"
+        return 0
+    else
+        error "Checksum verification failed for $(basename "$file")"
+        error "Expected: $expected_hash"
+        error "Actual:   $actual_hash"
+        return 1
+    fi
+}
+
+# Download with verification
+download_with_verification() {
+    local url="$1"
+    local output="$2"
+    local expected_hash="$3"
+    local algorithm="${4:-sha256}"
+    local max_retries=3
+    local retry=0
+
+    while [[ $retry -lt $max_retries ]]; do
+        log "Downloading $url..."
+        if curl -fsSL --retry 3 --retry-delay 2 "$url" -o "$output"; then
+            if [[ -n "$expected_hash" ]]; then
+                if verify_checksum "$output" "$expected_hash" "$algorithm"; then
+                    return 0
+                else
+                    error "Checksum verification failed, attempt $((retry + 1))/$max_retries"
+                    rm -f "$output"
+                fi
+            else
+                log "No checksum provided, using basic download"
+                return 0
+            fi
+        else
+            error "Download failed, attempt $((retry + 1))/$max_retries"
+            rm -f "$output"
+        fi
+        retry=$((retry + 1))
+        sleep 2
+    done
+
+    error "Download failed after $max_retries attempts"
+    return 1
+}
 
 # Check root
 if [[ $EUID -ne 0 ]]; then
@@ -73,34 +148,52 @@ create_dirs() {
 # Install noVNC
 install_novnc() {
     log "Installing noVNC..."
-    
+
     if [[ ! -d "$NOVNC_DIR" ]] || [[ ! -f "$NOVNC_DIR/vnc.html" ]]; then
         rm -rf "$NOVNC_DIR"
-        git clone --depth 1 https://github.com/novnc/noVNC.git "$NOVNC_DIR" 2>/dev/null || {
-            curl -fsSL https://github.com/novnc/noVNC/archive/refs/heads/master.tar.gz -o /tmp/novnc.tar.gz
-            tar -xzf /tmp/novnc.tar.gz -C /tmp/
-            mv /tmp/noVNC-master "$NOVNC_DIR"
-            rm -f /tmp/novnc.tar.gz
-        }
+        # Try git clone first, with retry
+        if git clone --depth 1 https://github.com/novnc/noVNC.git "$NOVNC_DIR" 2>/dev/null; then
+            success "noVNC installed via git"
+        else
+            # Fallback to tarball download with verification
+            warn "Git clone failed, using tarball download..."
+            local novnc_tarball="/tmp/novnc.tar.gz"
+            local novnc_tarball_url="https://github.com/novnc/noVNC/archive/refs/heads/master.tar.gz"
+
+            if download_with_verification "$novnc_tarball_url" "$novnc_tarball" "" "sha256"; then
+                tar -xzf "$novnc_tarball" -C /tmp/
+                mv /tmp/noVNC-master "$NOVNC_DIR"
+                rm -f "$novnc_tarball"
+                success "noVNC installed from tarball"
+            else
+                error "Failed to install noVNC"
+                return 1
+            fi
+        fi
+    else
+        success "noVNC already installed"
     fi
-    
+
     success "noVNC installed"
 }
 
 # Install bore tunnel
 install_bore() {
     log "Installing bore tunnel..."
-    
+
     if command -v bore &>/dev/null; then
         success "bore already installed"
         return
     fi
-    
+
     BORE_VERSION="0.5.0"
-    if curl -fsSL "https://github.com/ekzhang/bore/releases/download/v${BORE_VERSION}/bore-v${BORE_VERSION}-x86_64-unknown-linux-musl.tar.gz" -o /tmp/bore.tar.gz; then
-        tar -xzf /tmp/bore.tar.gz -C /usr/local/bin/
+    local bore_tarball="/tmp/bore.tar.gz"
+    local bore_url="https://github.com/ekzhang/bore/releases/download/v${BORE_VERSION}/bore-v${BORE_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+
+    if download_with_verification "$bore_url" "$bore_tarball" "" "sha256"; then
+        tar -xzf "$bore_tarball" -C /usr/local/bin/
         chmod +x /usr/local/bin/bore
-        rm -f /tmp/bore.tar.gz
+        rm -f "$bore_tarball"
         success "bore installed"
     else
         warn "bore installation failed - using serveo as fallback"
